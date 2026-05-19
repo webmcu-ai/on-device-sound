@@ -1,0 +1,1344 @@
+// ======================================================
+// XIAO ESP32-S3 SENSE
+// FULL AUDIO ML — WAKE WORD CLASSIFICATION v6
+//
+// CHANGES FROM v5:
+//   - BUG FIX: Training file scan builds full SD paths explicitly using
+//              folderPath + "/" + f.name() instead of f.path().
+//              f.path() on the Seeed SD library returns only the bare
+//              filename (e.g. "clip_12345.wav"), not the full path, so
+//              every SD.open() in myLoadClipFromSD() was silently failing.
+//              The batch loop ran but skipped every clip via 'continue',
+//              appearing frozen while doing nothing useful.
+//   - IMPROVE: Serial prints clip count per class at training start.
+//              If all counts are 0 the folder names are wrong.
+//   - IMPROVE: OLED shows per-class clip counts during scan.
+//   - IMPROVE: Per-clip load-failure counter printed each epoch so silent
+//              SD failures are immediately visible in the serial monitor.
+//
+// CHANGES FROM v4 (carried forward from v5):
+//   - BUG FIX: Uses myI2S.recordWAV() — confirmed working on this board.
+//   - BUG FIX: Spectrogram removed from collection; only runs at train/infer.
+//   - IMPROVE: Clips saved as .wav (recordWAV already writes WAV header).
+//   - IMPROVE: myLoadClipFromSD() seeks 44 bytes to skip WAV header.
+//
+// SD card layout:
+//   /audio/<ClassName>/clip_NNNNN.wav   — training clips
+//   /header/myWeights.bin               — saved weights (binary)
+//   /header/myWeights.h                 — saved weights (C header)
+//
+// INPUT:  1-second PDM @ 16 kHz -> 40-band Mel spectrogram (40x32 = 1280)
+// MODEL:  Conv1(3x3,4) -> MaxPool -> Conv2(3x3,8) -> Dense -> Softmax
+//
+// Arduino IDE Tools:
+//   Board:           XIAO_ESP32S3
+//   USB CDC On Boot: Enabled
+//   PSRAM:           OPI PSRAM
+//
+// By Jeremy Ellis  https://github.com/hpssjellis
+// MIT License
+// ======================================================
+
+//#define USE_BAKED_WEIGHTS
+#ifdef USE_BAKED_WEIGHTS
+  #include "myWeights.h"
+#endif
+
+#include "ESP_I2S.h"
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
+#include <vector>
+#include <algorithm>
+#include <math.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+
+U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
+
+// ======================================================
+// CLASS LABELS — edit to match your wake words
+// ======================================================
+#define NUM_CLASSES 3
+String myClassLabels[NUM_CLASSES] = {"0Silence", "1Yes", "2No"};
+const int myTotalItems = NUM_CLASSES + 2;   // classes + Train + Infer
+
+// ======================================================
+// HYPERPARAMETERS
+// ======================================================
+float LEARNING_RATE    = 0.0003f;
+int   BATCH_SIZE       = 6;
+int   TARGET_EPOCHS    = 20;
+int   VALIDATION_CLIPS = 3;   // clips per class held out for validation
+
+// ======================================================
+// AUDIO / SPECTROGRAM CONSTANTS
+// ======================================================
+#define SAMPLE_RATE   16000
+#define CLIP_SECONDS  1
+#define CLIP_SAMPLES  (SAMPLE_RATE * CLIP_SECONDS)   // 16000 samples
+#define MEL_BINS      40
+#define MEL_FRAMES    32
+#define FRAME_SIZE    (CLIP_SAMPLES / MEL_FRAMES)    // 500 samples/frame
+#define FFT_SIZE      512
+
+#define INPUT_W       MEL_BINS    // 40  (spectrogram "width")
+#define INPUT_H       MEL_FRAMES  // 32  (spectrogram "height")
+#define INPUT_CH      1           // single-channel (greyscale spectrogram)
+
+// ======================================================
+// CNN ARCHITECTURE  (mirrors vision v44, 1-channel input)
+// ======================================================
+#define CONV1_FILTERS  4
+#define CONV1_WEIGHTS  (3 * 3 * INPUT_CH * CONV1_FILTERS)        //  36
+
+#define CONV2_FILTERS  8
+#define CONV2_WEIGHTS  (3 * 3 * CONV1_FILTERS * CONV2_FILTERS)   // 288
+
+#define CONV1_OUT_H   (INPUT_H - 2)         // 30
+#define CONV1_OUT_W   (INPUT_W - 2)         // 38
+#define POOL1_OUT_H   (CONV1_OUT_H / 2)     // 15
+#define POOL1_OUT_W   (CONV1_OUT_W / 2)     // 19
+#define CONV2_OUT_H   (POOL1_OUT_H - 2)     // 13
+#define CONV2_OUT_W   (POOL1_OUT_W - 2)     // 17
+
+#define FLATTENED_SIZE  (CONV2_OUT_H * CONV2_OUT_W * CONV2_FILTERS)  // 1768
+#define OUTPUT_WEIGHTS  (FLATTENED_SIZE * NUM_CLASSES)
+
+// ======================================================
+// TOUCH INPUT
+// ======================================================
+const int myThresholdPress   = 1100;
+const int myThresholdRelease = 900;
+
+struct TouchState {
+  bool          isTouching      = false;
+  int           tapCount        = 0;
+  unsigned long firstTapTime    = 0;
+  unsigned long lastReleaseTime = 0;
+  unsigned long lastCheckTime   = 0;
+  const unsigned long tapWindow     = 800;
+  const int           longPressTaps = 3;
+  const unsigned long debounceDelay = 50;
+};
+TouchState myTouch;
+
+// ======================================================
+// SYSTEM STATE
+// ======================================================
+unsigned long myLastActivityTime = 0;
+unsigned long myLastTapTime      = 0;
+const int     myTapCooldown      = 250;
+int  myMenuIndex      = 1;
+bool myIsSelected     = false;
+bool myWeightsTrained = false;
+bool mySDavailable    = false;
+
+// ======================================================
+// AUDIO
+// ======================================================
+I2SClass myI2S;
+// myAudioBuffer holds PCM loaded from SD for training/inference.
+// Recording uses myI2S.recordWAV() which manages its own buffer.
+int16_t* myAudioBuffer = nullptr;
+
+// ======================================================
+// SPECTROGRAM SCRATCH BUFFERS — allocated once in PSRAM
+// ======================================================
+float* mySpectroFrame = nullptr;   // FFT_SIZE floats
+float* mySpectroPower = nullptr;   // FFT_SIZE/2+1 floats
+
+// ======================================================
+// ML WEIGHT / ACTIVATION / GRADIENT BUFFERS (PSRAM)
+// ======================================================
+float* myInputBuffer  = nullptr;
+
+float* myConv1_w  = nullptr;  float* myConv1_b  = nullptr;
+float* myConv2_w  = nullptr;  float* myConv2_b  = nullptr;
+float* myOutput_w = nullptr;  float* myOutput_b = nullptr;
+
+float* myConv1_w_grad  = nullptr; float* myConv1_b_grad  = nullptr;
+float* myConv2_w_grad  = nullptr; float* myConv2_b_grad  = nullptr;
+float* myOutput_w_grad = nullptr; float* myOutput_b_grad = nullptr;
+
+float* myConv1_w_m = nullptr; float* myConv1_w_v = nullptr;
+float* myConv1_b_m = nullptr; float* myConv1_b_v = nullptr;
+float* myConv2_w_m = nullptr; float* myConv2_w_v = nullptr;
+float* myConv2_b_m = nullptr; float* myConv2_b_v = nullptr;
+float* myOutput_w_m = nullptr; float* myOutput_w_v = nullptr;
+float* myOutput_b_m = nullptr; float* myOutput_b_v = nullptr;
+
+float* myConv1_output = nullptr;
+float* myPool1_output = nullptr;
+float* myConv2_output = nullptr;
+float* myDense_output = nullptr;
+
+float* myDense_grad = nullptr;
+float* myConv2_grad = nullptr;
+float* myPool1_grad = nullptr;
+float* myConv1_grad = nullptr;
+
+struct TrainingItem { String path; int label; };
+std::vector<TrainingItem> myTrainingData;
+
+// ======================================================
+// UTILITY
+// ======================================================
+inline float clip_value(float v, float mn = -100, float mx = 100) {
+  if (isnan(v) || isinf(v)) return 0;
+  return constrain(v, mn, mx);
+}
+inline float leaky_relu(float x)       { return x > 0 ? x : 0.1f * x; }
+inline float leaky_relu_deriv(float x) { return x > 0 ? 1.0f : 0.1f; }
+
+// ======================================================
+// TOUCH INPUT
+// ======================================================
+int myReadTouch() {
+  int sum = 0;
+  for (int i = 0; i < 3; i++) { sum += analogRead(A0); delayMicroseconds(100); }
+  return sum / 3;
+}
+
+void myResetTouchState() {
+  myTouch.isTouching      = false;
+  myTouch.tapCount        = 0;
+  myTouch.firstTapTime    = 0;
+  myTouch.lastReleaseTime = 0;
+  myTouch.lastCheckTime   = 0;
+}
+
+void myUpdateTouchState() {
+  unsigned long now = millis();
+  if (now - myTouch.lastCheckTime < 20) return;
+  myTouch.lastCheckTime = now;
+  int val = myReadTouch();
+  bool active = myTouch.isTouching ? (val > myThresholdRelease) : (val > myThresholdPress);
+  if (active && !myTouch.isTouching) {
+    if (now - myTouch.lastReleaseTime < myTouch.debounceDelay) return;
+    myTouch.isTouching = true;
+    if (myTouch.tapCount == 0 || (now - myTouch.firstTapTime < myTouch.tapWindow)) {
+      if (myTouch.tapCount == 0) myTouch.firstTapTime = now;
+      myTouch.tapCount++;
+    } else {
+      myTouch.tapCount     = 1;
+      myTouch.firstTapTime = now;
+    }
+  }
+  if (!active && myTouch.isTouching) {
+    myTouch.isTouching      = false;
+    myTouch.lastReleaseTime = now;
+  }
+}
+
+int myCheckTouchInput() {
+  myUpdateTouchState();
+  unsigned long now = millis();
+  if (myTouch.tapCount > 0 && !myTouch.isTouching &&
+      now - myTouch.firstTapTime > myTouch.tapWindow) {
+    int result = (myTouch.tapCount >= myTouch.longPressTaps) ? 2 : 1;
+    myResetTouchState();
+    return result;
+  }
+  return 0;
+}
+
+void myCheckTouchBackground() { myUpdateTouchState(); }
+
+int myPeekTouchAction() {
+  myUpdateTouchState();
+  if (myTouch.tapCount > 0 && !myTouch.isTouching &&
+      millis() - myTouch.firstTapTime > myTouch.tapWindow)
+    return (myTouch.tapCount >= myTouch.longPressTaps) ? 2 : 1;
+  return 0;
+}
+
+// ======================================================
+// RECORD AND SAVE A CLIP TO SD
+// ======================================================
+// Uses myI2S.recordWAV() — confirmed working (matches sound-to-sd-card.txt).
+// recordWAV() blocks for CLIP_SECONDS, returns a malloc'd buffer containing
+// a complete WAV file (44-byte header + PCM), and sets wav_size.
+// We write that buffer straight to SD and free it.
+// No spectrogram computation here — collection is: tap -> 1s record -> save.
+bool mySaveClipToSD(const String& path) {
+  size_t   wav_size   = 0;
+  uint8_t* wav_buffer = myI2S.recordWAV(CLIP_SECONDS, &wav_size);
+  if (!wav_buffer || wav_size == 0) {
+    Serial.println("recordWAV() returned null/empty");
+    return false;
+  }
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) {
+    free(wav_buffer);
+    Serial.println("SD open failed for write");
+    return false;
+  }
+  bool ok = (f.write(wav_buffer, wav_size) == wav_size);
+  f.close();
+  free(wav_buffer);
+  if (!ok) Serial.println("SD write incomplete");
+  return ok;
+}
+
+// ======================================================
+// LOAD A CLIP FROM SD INTO myAudioBuffer
+// ======================================================
+// Seeks past the 44-byte WAV header to read raw int16 PCM.
+bool myLoadClipFromSD(const char* path) {
+  File f = SD.open(path);
+  if (!f) {
+    Serial.printf("  SD.open FAILED: %s\n", path);
+    return false;
+  }
+  f.seek(44);   // skip WAV header
+  size_t want = CLIP_SAMPLES * sizeof(int16_t);
+  size_t got  = f.read((uint8_t*)myAudioBuffer, want);
+  f.close();
+  if (got < want) memset((uint8_t*)myAudioBuffer + got, 0, want - got);
+  return (got > 0);
+}
+
+// ======================================================
+// MEL FILTERBANK
+// ======================================================
+static float myHzToMel(float hz)  { return 2595.0f * log10f(1.0f + hz / 700.0f); }
+static float myMelToHz(float mel) { return 700.0f * (powf(10.0f, mel / 2595.0f) - 1.0f); }
+
+static float* myMelFbLo  = nullptr;
+static float* myMelFbCtr = nullptr;
+static float* myMelFbHi  = nullptr;
+
+void myBuildMelFilterbank() {
+  if (myMelFbCtr) return;
+  myMelFbLo  = (float*)ps_malloc(MEL_BINS * sizeof(float));
+  myMelFbCtr = (float*)ps_malloc(MEL_BINS * sizeof(float));
+  myMelFbHi  = (float*)ps_malloc(MEL_BINS * sizeof(float));
+  float melLow   = myHzToMel(20.0f);
+  float melHigh  = myHzToMel(SAMPLE_RATE / 2.0f);
+  float melStep  = (melHigh - melLow) / (MEL_BINS + 1);
+  float binScale = (float)FFT_SIZE / (float)SAMPLE_RATE;
+  for (int m = 0; m < MEL_BINS; m++) {
+    myMelFbLo[m]  = myMelToHz(melLow + (m    ) * melStep) * binScale;
+    myMelFbCtr[m] = myMelToHz(melLow + (m + 1) * melStep) * binScale;
+    myMelFbHi[m]  = myMelToHz(melLow + (m + 2) * melStep) * binScale;
+  }
+  Serial.println("Mel filterbank built");
+}
+
+// ======================================================
+// POWER SPECTRUM  (real DFT, O(N^2) — swap for esp_dsp if speed needed)
+// ======================================================
+static void myPowerSpectrum(const float* frame, float* power, int n) {
+  int bins = n / 2 + 1;
+  for (int k = 0; k < bins; k++) {
+    float re = 0, im = 0;
+    float step = -2.0f * (float)M_PI * k / n;
+    for (int t = 0; t < n; t++) {
+      re += frame[t] * cosf(step * t);
+      im += frame[t] * sinf(step * t);
+    }
+    power[k] = re * re + im * im;
+  }
+}
+
+// ======================================================
+// SPECTROGRAM  (myAudioBuffer -> myInputBuffer, normalised 0-1)
+// ======================================================
+bool myComputeSpectrogram() {
+  if (!myAudioBuffer || !myInputBuffer || !myMelFbCtr) return false;
+  if (!mySpectroFrame || !mySpectroPower)              return false;
+
+  float globalMax = 1e-8f;
+  for (int fr = 0; fr < MEL_FRAMES; fr++) {
+    int startSample = fr * FRAME_SIZE;
+    memset(mySpectroFrame, 0, FFT_SIZE * sizeof(float));
+    for (int i = 0; i < FRAME_SIZE && i < FFT_SIZE; i++) {
+      float hann = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (FRAME_SIZE - 1)));
+      mySpectroFrame[i] = (myAudioBuffer[startSample + i] / 32768.0f) * hann;
+    }
+    myPowerSpectrum(mySpectroFrame, mySpectroPower, FFT_SIZE);
+    for (int m = 0; m < MEL_BINS; m++) {
+      int loB  = (int)myMelFbLo[m];
+      int ctrB = (int)myMelFbCtr[m];
+      int hiB  = (int)min((float)(FFT_SIZE / 2), myMelFbHi[m]);
+      float energy = 0;
+      for (int b = loB; b < ctrB && b <= FFT_SIZE / 2; b++) {
+        float w = (b - myMelFbLo[m]) / (myMelFbCtr[m] - myMelFbLo[m] + 1e-8f);
+        energy += w * mySpectroPower[b];
+      }
+      for (int b = ctrB; b < hiB && b <= FFT_SIZE / 2; b++) {
+        float w = (myMelFbHi[m] - b) / (myMelFbHi[m] - myMelFbCtr[m] + 1e-8f);
+        energy += w * mySpectroPower[b];
+      }
+      float logE = log10f(energy + 1e-8f);
+      myInputBuffer[fr * MEL_BINS + m] = logE;
+      if (logE > globalMax) globalMax = logE;
+    }
+  }
+  float logMin = -8.0f;
+  float range  = globalMax - logMin;
+  if (range < 1e-6f) range = 1e-6f;
+  for (int i = 0; i < MEL_FRAMES * MEL_BINS; i++)
+    myInputBuffer[i] = constrain((myInputBuffer[i] - logMin) / range, 0.0f, 1.0f);
+  return true;
+}
+
+bool myLoadClipAndComputeSpectrogram(const char* path) {
+  return myLoadClipFromSD(path) && myComputeSpectrogram();
+}
+
+// ======================================================
+// MEMORY ALLOCATION (PSRAM)
+// ======================================================
+void myAllocateMemory() {
+  if (myInputBuffer) return;
+  Serial.println("\n=== Allocating PSRAM ===");
+
+  myAudioBuffer  = (int16_t*)ps_malloc(CLIP_SAMPLES * sizeof(int16_t));
+  myInputBuffer  = (float*)ps_malloc(MEL_FRAMES * MEL_BINS * sizeof(float));
+  mySpectroFrame = (float*)ps_malloc(FFT_SIZE * sizeof(float));
+  mySpectroPower = (float*)ps_malloc((FFT_SIZE / 2 + 1) * sizeof(float));
+
+  myConv1_w  = (float*)ps_malloc(CONV1_WEIGHTS * sizeof(float));
+  myConv1_b  = (float*)ps_malloc(CONV1_FILTERS * sizeof(float));
+  myConv2_w  = (float*)ps_malloc(CONV2_WEIGHTS * sizeof(float));
+  myConv2_b  = (float*)ps_malloc(CONV2_FILTERS * sizeof(float));
+  myOutput_w = (float*)ps_malloc(OUTPUT_WEIGHTS * sizeof(float));
+  myOutput_b = (float*)ps_malloc(NUM_CLASSES * sizeof(float));
+
+  myConv1_w_grad  = (float*)ps_malloc(CONV1_WEIGHTS * sizeof(float));
+  myConv1_b_grad  = (float*)ps_malloc(CONV1_FILTERS * sizeof(float));
+  myConv2_w_grad  = (float*)ps_malloc(CONV2_WEIGHTS * sizeof(float));
+  myConv2_b_grad  = (float*)ps_malloc(CONV2_FILTERS * sizeof(float));
+  myOutput_w_grad = (float*)ps_malloc(OUTPUT_WEIGHTS * sizeof(float));
+  myOutput_b_grad = (float*)ps_malloc(NUM_CLASSES * sizeof(float));
+
+  myConv1_w_m  = (float*)ps_calloc(CONV1_WEIGHTS, sizeof(float));
+  myConv1_w_v  = (float*)ps_calloc(CONV1_WEIGHTS, sizeof(float));
+  myConv1_b_m  = (float*)ps_calloc(CONV1_FILTERS, sizeof(float));
+  myConv1_b_v  = (float*)ps_calloc(CONV1_FILTERS, sizeof(float));
+  myConv2_w_m  = (float*)ps_calloc(CONV2_WEIGHTS, sizeof(float));
+  myConv2_w_v  = (float*)ps_calloc(CONV2_WEIGHTS, sizeof(float));
+  myConv2_b_m  = (float*)ps_calloc(CONV2_FILTERS, sizeof(float));
+  myConv2_b_v  = (float*)ps_calloc(CONV2_FILTERS, sizeof(float));
+  myOutput_w_m = (float*)ps_calloc(OUTPUT_WEIGHTS, sizeof(float));
+  myOutput_w_v = (float*)ps_calloc(OUTPUT_WEIGHTS, sizeof(float));
+  myOutput_b_m = (float*)ps_calloc(NUM_CLASSES, sizeof(float));
+  myOutput_b_v = (float*)ps_calloc(NUM_CLASSES, sizeof(float));
+
+  myConv1_output = (float*)ps_malloc(CONV1_OUT_H * CONV1_OUT_W * CONV1_FILTERS * sizeof(float));
+  myPool1_output = (float*)ps_malloc(POOL1_OUT_H * POOL1_OUT_W * CONV1_FILTERS * sizeof(float));
+  myConv2_output = (float*)ps_malloc(CONV2_OUT_H * CONV2_OUT_W * CONV2_FILTERS * sizeof(float));
+  myDense_output = (float*)ps_malloc(NUM_CLASSES * sizeof(float));
+
+  myDense_grad = (float*)ps_malloc(FLATTENED_SIZE * sizeof(float));
+  myConv2_grad = (float*)ps_malloc(CONV2_OUT_H * CONV2_OUT_W * CONV2_FILTERS * sizeof(float));
+  myPool1_grad = (float*)ps_malloc(POOL1_OUT_H * POOL1_OUT_W * CONV1_FILTERS * sizeof(float));
+  myConv1_grad = (float*)ps_malloc(CONV1_OUT_H * CONV1_OUT_W * CONV1_FILTERS * sizeof(float));
+
+  if (!myInputBuffer || !myAudioBuffer || !mySpectroFrame || !mySpectroPower ||
+      !myConv1_w || !myConv2_w || !myOutput_w ||
+      !myConv1_output || !myPool1_output || !myConv2_output || !myDense_output) {
+    Serial.println("FATAL: PSRAM allocation failed!");
+    u8g2.firstPage();
+    do { u8g2.drawStr(0, 15, "PSRAM ERROR!"); } while (u8g2.nextPage());
+    while (1) delay(1000);
+  }
+  Serial.printf("Free PSRAM after alloc: %d bytes\n", ESP.getFreePsram());
+
+  // He initialisation
+  float c1std = sqrtf(2.0f / (9.0f * INPUT_CH));
+  for (int i = 0; i < CONV1_WEIGHTS; i++)
+    myConv1_w[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * c1std;
+  for (int i = 0; i < CONV1_FILTERS; i++) myConv1_b[i] = 0;
+
+  float c2std = sqrtf(2.0f / (9.0f * CONV1_FILTERS));
+  for (int i = 0; i < CONV2_WEIGHTS; i++)
+    myConv2_w[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * c2std;
+  for (int i = 0; i < CONV2_FILTERS; i++) myConv2_b[i] = 0;
+
+  float dstd = sqrtf(2.0f / FLATTENED_SIZE);
+  for (int i = 0; i < OUTPUT_WEIGHTS; i++)
+    myOutput_w[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * dstd;
+  for (int i = 0; i < NUM_CLASSES; i++) myOutput_b[i] = 0;
+
+  Serial.println("He-init complete");
+}
+
+// ======================================================
+// WEIGHT SAVE / LOAD / EXPORT
+// ======================================================
+void myExportHeader() {
+  if (!mySDavailable) return;
+  if (!SD.exists("/header")) SD.mkdir("/header");
+  File file = SD.open("/header/myWeights.h", FILE_WRITE);
+  if (!file) return;
+  file.println("#ifndef MY_MODEL_H\n#define MY_MODEL_H");
+  file.printf("// NUM_CLASSES %d\n// Labels:", NUM_CLASSES);
+  for (int i = 0; i < NUM_CLASSES; i++) file.printf(" \"%s\"", myClassLabels[i].c_str());
+  file.println("\n// Uncomment #define USE_BAKED_WEIGHTS in main sketch to use these.");
+  auto myDump = [&](const char* name, float* data, int size) {
+    file.printf("const float %s[] = {", name);
+    for (int i = 0; i < size; i++) {
+      file.print(data[i], 6); file.print("f");
+      if (i < size - 1) file.print(",");
+      if ((i + 1) % 8 == 0) file.println();
+    }
+    file.println("};");
+  };
+  myDump("myModel_conv1_w",  myConv1_w,  CONV1_WEIGHTS);
+  myDump("myModel_conv1_b",  myConv1_b,  CONV1_FILTERS);
+  myDump("myModel_conv2_w",  myConv2_w,  CONV2_WEIGHTS);
+  myDump("myModel_conv2_b",  myConv2_b,  CONV2_FILTERS);
+  myDump("myModel_output_w", myOutput_w, OUTPUT_WEIGHTS);
+  myDump("myModel_output_b", myOutput_b, NUM_CLASSES);
+  file.println("#endif");
+  file.close();
+  Serial.println("Header exported: /header/myWeights.h");
+}
+
+bool myLoadWeights() {
+  if (!mySDavailable || !SD.exists("/header/myWeights.bin")) return false;
+  File f = SD.open("/header/myWeights.bin", FILE_READ);
+  if (!f) return false;
+  f.read((uint8_t*)myConv1_w,  CONV1_WEIGHTS  * 4);
+  f.read((uint8_t*)myConv1_b,  CONV1_FILTERS  * 4);
+  f.read((uint8_t*)myConv2_w,  CONV2_WEIGHTS  * 4);
+  f.read((uint8_t*)myConv2_b,  CONV2_FILTERS  * 4);
+  f.read((uint8_t*)myOutput_w, OUTPUT_WEIGHTS * 4);
+  f.read((uint8_t*)myOutput_b, NUM_CLASSES    * 4);
+  f.close();
+  myWeightsTrained = true;
+  Serial.println("Weights loaded from SD");
+  return true;
+}
+
+void mySaveWeights() {
+  if (!mySDavailable) return;
+  if (!SD.exists("/header")) SD.mkdir("/header");
+  File f = SD.open("/header/myWeights.bin", FILE_WRITE);
+  if (f) {
+    f.write((uint8_t*)myConv1_w,  CONV1_WEIGHTS  * 4);
+    f.write((uint8_t*)myConv1_b,  CONV1_FILTERS  * 4);
+    f.write((uint8_t*)myConv2_w,  CONV2_WEIGHTS  * 4);
+    f.write((uint8_t*)myConv2_b,  CONV2_FILTERS  * 4);
+    f.write((uint8_t*)myOutput_w, OUTPUT_WEIGHTS * 4);
+    f.write((uint8_t*)myOutput_b, NUM_CLASSES    * 4);
+    f.close();
+    Serial.println("Weights saved");
+  }
+  myExportHeader();
+}
+
+// ██████████████████████████████████████████████████████████████████████████████
+// ██  FORWARD / BACKWARD PASS + OPTIMIZER                                      ██
+// ██████████████████████████████████████████████████████████████████████████████
+
+void myForwardPass(float* input, float* logits) {
+  // Conv1 (1-channel input)
+  for (int f = 0; f < CONV1_FILTERS; f++) {
+    int ob = f * CONV1_OUT_H * CONV1_OUT_W;
+    for (int y = 0; y < CONV1_OUT_H; y++) {
+      for (int x = 0; x < CONV1_OUT_W; x++) {
+        float sum = 0;
+        for (int ky = 0; ky < 3; ky++)
+          for (int kx = 0; kx < 3; kx++)
+            sum += input[(y + ky) * INPUT_W + (x + kx)] * myConv1_w[f * 9 + ky * 3 + kx];
+        myConv1_output[ob + y * CONV1_OUT_W + x] = leaky_relu(clip_value(sum + myConv1_b[f]));
+      }
+    }
+  }
+  // Pool1 (2x2 max)
+  for (int f = 0; f < CONV1_FILTERS; f++) {
+    int ib = f * CONV1_OUT_H * CONV1_OUT_W;
+    int ob = f * POOL1_OUT_H * POOL1_OUT_W;
+    for (int y = 0; y < POOL1_OUT_H; y++) {
+      for (int x = 0; x < POOL1_OUT_W; x++) {
+        int iy = y * 2, ix = x * 2;
+        float mv = myConv1_output[ib +  iy      * CONV1_OUT_W + ix];
+        mv = max(mv, myConv1_output[ib +  iy      * CONV1_OUT_W + ix + 1]);
+        mv = max(mv, myConv1_output[ib + (iy + 1) * CONV1_OUT_W + ix]);
+        mv = max(mv, myConv1_output[ib + (iy + 1) * CONV1_OUT_W + ix + 1]);
+        myPool1_output[ob + y * POOL1_OUT_W + x] = mv;
+      }
+    }
+  }
+  // Conv2
+  for (int f = 0; f < CONV2_FILTERS; f++) {
+    int ob = f * CONV2_OUT_H * CONV2_OUT_W;
+    for (int y = 0; y < CONV2_OUT_H; y++) {
+      for (int x = 0; x < CONV2_OUT_W; x++) {
+        float sum = 0;
+        for (int c = 0; c < CONV1_FILTERS; c++) {
+          int ib = c * POOL1_OUT_H * POOL1_OUT_W;
+          for (int ky = 0; ky < 3; ky++)
+            for (int kx = 0; kx < 3; kx++)
+              sum += myPool1_output[ib + (y + ky) * POOL1_OUT_W + (x + kx)] *
+                     myConv2_w[f * (CONV1_FILTERS * 9) + c * 9 + ky * 3 + kx];
+        }
+        myConv2_output[ob + y * CONV2_OUT_W + x] = leaky_relu(clip_value(sum + myConv2_b[f]));
+      }
+    }
+  }
+  // Dense + Softmax (Kahan summation for numerical stability)
+  for (int c = 0; c < NUM_CLASSES; c++) {
+    double sum = 0, comp = 0;
+    for (int i = 0; i < FLATTENED_SIZE; i++) {
+      double term = myConv2_output[i] * myOutput_w[c * FLATTENED_SIZE + i];
+      double yy = term - comp; double t = sum + yy;
+      comp = (t - sum) - yy; sum = t;
+    }
+    myDense_output[c] = clip_value((float)sum + myOutput_b[c], -50, 50);
+  }
+  float mx = myDense_output[0];
+  for (int i = 1; i < NUM_CLASSES; i++) mx = max(mx, myDense_output[i]);
+  float expSum = 0;
+  for (int i = 0; i < NUM_CLASSES; i++) expSum += expf(myDense_output[i] - mx);
+  for (int i = 0; i < NUM_CLASSES; i++) {
+    logits[i]         = myDense_output[i];
+    myDense_output[i] = expf(myDense_output[i] - mx) / expSum;
+  }
+}
+
+void myBackwardDense(int label) {
+  memset(myDense_grad, 0, FLATTENED_SIZE * sizeof(float));
+  for (int c = 0; c < NUM_CLASSES; c++) {
+    float err = myDense_output[c] - (c == label ? 1.0f : 0.0f);
+    for (int i = 0; i < FLATTENED_SIZE; i++) {
+      myOutput_w_grad[c * FLATTENED_SIZE + i] += err * myConv2_output[i];
+      myDense_grad[i] += err * myOutput_w[c * FLATTENED_SIZE + i];
+    }
+    myOutput_b_grad[c] += err;
+  }
+}
+
+void myBackwardConv2() {
+  for (int i = 0; i < FLATTENED_SIZE; i++)
+    myConv2_grad[i] = myDense_grad[i] * leaky_relu_deriv(myConv2_output[i]);
+  memset(myPool1_grad, 0, POOL1_OUT_H * POOL1_OUT_W * CONV1_FILTERS * sizeof(float));
+  for (int f = 0; f < CONV2_FILTERS; f++) {
+    int ob = f * CONV2_OUT_H * CONV2_OUT_W;
+    for (int y = 0; y < CONV2_OUT_H; y++) {
+      for (int x = 0; x < CONV2_OUT_W; x++) {
+        float grad = myConv2_grad[ob + y * CONV2_OUT_W + x];
+        myConv2_b_grad[f] += grad;
+        for (int c = 0; c < CONV1_FILTERS; c++) {
+          int ib = c * POOL1_OUT_H * POOL1_OUT_W;
+          for (int ky = 0; ky < 3; ky++) {
+            for (int kx = 0; kx < 3; kx++) {
+              int pi = ib + (y + ky) * POOL1_OUT_W + (x + kx);
+              int wi = f * (CONV1_FILTERS * 9) + c * 9 + ky * 3 + kx;
+              myConv2_w_grad[wi] += grad * myPool1_output[pi];
+              myPool1_grad[pi]   += grad * myConv2_w[wi];
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void myBackwardPool1() {
+  memset(myConv1_grad, 0, CONV1_OUT_H * CONV1_OUT_W * CONV1_FILTERS * sizeof(float));
+  for (int f = 0; f < CONV1_FILTERS; f++) {
+    int ib = f * CONV1_OUT_H * CONV1_OUT_W;
+    int ob = f * POOL1_OUT_H * POOL1_OUT_W;
+    for (int y = 0; y < POOL1_OUT_H; y++) {
+      for (int x = 0; x < POOL1_OUT_W; x++) {
+        float poolVal = myPool1_output[ob + y * POOL1_OUT_W + x];
+        float grad    = myPool1_grad  [ob + y * POOL1_OUT_W + x];
+        int iy = y * 2, ix = x * 2;
+        if (myConv1_output[ib +  iy      * CONV1_OUT_W + ix    ] == poolVal) myConv1_grad[ib +  iy      * CONV1_OUT_W + ix    ] += grad;
+        if (myConv1_output[ib +  iy      * CONV1_OUT_W + ix + 1] == poolVal) myConv1_grad[ib +  iy      * CONV1_OUT_W + ix + 1] += grad;
+        if (myConv1_output[ib + (iy + 1) * CONV1_OUT_W + ix    ] == poolVal) myConv1_grad[ib + (iy + 1) * CONV1_OUT_W + ix    ] += grad;
+        if (myConv1_output[ib + (iy + 1) * CONV1_OUT_W + ix + 1] == poolVal) myConv1_grad[ib + (iy + 1) * CONV1_OUT_W + ix + 1] += grad;
+      }
+    }
+  }
+}
+
+void myBackwardConv1() {
+  for (int i = 0; i < CONV1_OUT_H * CONV1_OUT_W * CONV1_FILTERS; i++)
+    myConv1_grad[i] *= leaky_relu_deriv(myConv1_output[i]);
+  for (int f = 0; f < CONV1_FILTERS; f++) {
+    int ob = f * CONV1_OUT_H * CONV1_OUT_W;
+    for (int y = 0; y < CONV1_OUT_H; y++) {
+      for (int x = 0; x < CONV1_OUT_W; x++) {
+        float grad = myConv1_grad[ob + y * CONV1_OUT_W + x];
+        myConv1_b_grad[f] += grad;
+        for (int ky = 0; ky < 3; ky++)
+          for (int kx = 0; kx < 3; kx++)
+            myConv1_w_grad[f * 9 + ky * 3 + kx] +=
+              grad * myInputBuffer[(y + ky) * INPUT_W + (x + kx)];
+      }
+    }
+  }
+}
+
+void myAdamUpdate(float* w, float* g, float* m, float* v, int size, int step) {
+  float b1 = 0.9f, b2 = 0.999f, eps = 1e-6f;
+  float lr_t = LEARNING_RATE * sqrtf(1 - powf(b2, step)) / (1 - powf(b1, step));
+  for (int i = 0; i < size; i++) {
+    m[i] = b1 * m[i] + (1 - b1) * g[i];
+    v[i] = b2 * v[i] + (1 - b2) * g[i] * g[i];
+    w[i] -= lr_t * m[i] / (sqrtf(v[i]) + eps);
+    w[i]  = clip_value(w[i], -10, 10);
+  }
+}
+
+void myUpdateWeights(int step) {
+  myAdamUpdate(myConv1_w,  myConv1_w_grad,  myConv1_w_m,  myConv1_w_v,  CONV1_WEIGHTS,  step);
+  myAdamUpdate(myConv1_b,  myConv1_b_grad,  myConv1_b_m,  myConv1_b_v,  CONV1_FILTERS,  step);
+  myAdamUpdate(myConv2_w,  myConv2_w_grad,  myConv2_w_m,  myConv2_w_v,  CONV2_WEIGHTS,  step);
+  myAdamUpdate(myConv2_b,  myConv2_b_grad,  myConv2_b_m,  myConv2_b_v,  CONV2_FILTERS,  step);
+  myAdamUpdate(myOutput_w, myOutput_w_grad, myOutput_w_m, myOutput_w_v, OUTPUT_WEIGHTS, step);
+  myAdamUpdate(myOutput_b, myOutput_b_grad, myOutput_b_m, myOutput_b_v, NUM_CLASSES,    step);
+}
+
+// ██████████████████████████████████████████████████████████████████████████████
+// ██  MENU SYSTEM                                                               ██
+// ██████████████████████████████████████████████████████████████████████████████
+
+void myResetMenuState();
+void myDrawMenu();
+void myActionCollect(int classIdx);
+void myActionTrain();
+void myActionInfer();
+
+void myResetMenuState() {
+  myIsSelected = false;
+  myResetTouchState();
+  myLastActivityTime = millis();
+  myDrawMenu();
+}
+
+void myDrawMenu() {
+  Serial.println("\n=== MENU ===");
+  for (int i = 1; i <= myTotalItems; i++) {
+    String label = (i <= NUM_CLASSES) ? myClassLabels[i - 1] :
+                   (i == NUM_CLASSES + 1) ? "Train" : "Infer";
+    Serial.printf("%s %d. %s\n", i == myMenuIndex ? " >" : "  ", i, label.c_str());
+  }
+  Serial.println("t=next  l=select  1-9=direct");
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 8, "TAP:Next HOLD:Ok");
+    int start = (myMenuIndex <= NUM_CLASSES) ? 1 : myMenuIndex - 2;
+    for (int i = 0; i < 3; i++) {
+      int cur = start + i;
+      if (cur > myTotalItems) break;
+      String label = (cur <= NUM_CLASSES) ? myClassLabels[cur - 1] :
+                     (cur == NUM_CLASSES + 1) ? "Train" : "Infer";
+      u8g2.drawStr(0, 18 + i * 9,
+                   (cur == myMenuIndex ? "> " + label : "  " + label).c_str());
+    }
+  } while (u8g2.nextPage());
+}
+
+void myExecuteMenuItem(int idx) {
+  if (idx <= NUM_CLASSES)        myActionCollect(idx - 1);
+  else if (idx == NUM_CLASSES + 1) myActionTrain();
+  else                             myActionInfer();
+}
+
+void myHandleMenuNavigation() {
+  unsigned long now = millis();
+  if (!myIsSelected && Serial.available()) {
+    char c = Serial.read();
+    if (c >= '1' && c <= '9') {
+      int n = c - '0';
+      if (n <= myTotalItems) {
+        myMenuIndex = n; myIsSelected = true;
+        myLastActivityTime = now; myExecuteMenuItem(myMenuIndex);
+      }
+    } else if (c == 't' || c == 'T') {
+      if (now - myLastTapTime > myTapCooldown) {
+        myMenuIndex = (myMenuIndex % myTotalItems) + 1;
+        myDrawMenu(); myLastTapTime = now; myLastActivityTime = now;
+      }
+    } else if (c == 'l' || c == 'L') {
+      myIsSelected = true; myLastActivityTime = now; myExecuteMenuItem(myMenuIndex);
+    }
+  }
+  if (!myIsSelected) {
+    int ta = myCheckTouchInput();
+    if (ta == 1) {
+      if (now - myLastTapTime > myTapCooldown) {
+        myMenuIndex = (myMenuIndex % myTotalItems) + 1;
+        myDrawMenu(); myLastTapTime = now; myLastActivityTime = now;
+      }
+    } else if (ta == 2) {
+      myIsSelected = true; myLastActivityTime = now; myExecuteMenuItem(myMenuIndex);
+    }
+  }
+}
+
+// ██████████████████████████████████████████████████████████████████████████████
+// ██  SETUP & LOOP                                                              ██
+// ██████████████████████████████████████████████████████████████████████████████
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);
+  delay(500);
+  Serial.println("\n=== XIAO ESP32-S3 Audio ML v6 ===");
+  Serial.printf("Heap: %d  PSRAM: %d\n", ESP.getFreeHeap(), ESP.getFreePsram());
+
+  pinMode(A0, INPUT);
+  u8g2.begin();
+
+  // SD card
+  pinMode(21, OUTPUT); digitalWrite(21, HIGH); delay(100);
+  SPI.begin(); SPI.setFrequency(400000);
+  mySDavailable = SD.begin(21, SPI, 400000, "/sd", 5, false);
+  if (!mySDavailable) {
+    SD.end();
+    Serial.println("No SD card");
+    u8g2.firstPage();
+    do { u8g2.drawStr(0, 15, "No SD card"); } while (u8g2.nextPage());
+    delay(2000);
+  } else {
+    Serial.println("SD mounted");
+  }
+
+  // I2S mic — matches sound-to-sd-card.txt exactly
+  myI2S.setPinsPdmRx(42, 41);
+  if (!myI2S.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println("FATAL: I2S init failed!");
+    u8g2.firstPage();
+    do { u8g2.drawStr(0, 15, "MIC FAIL!"); } while (u8g2.nextPage());
+    while (1) delay(1000);
+  }
+  Serial.println("I2S mic OK");
+
+  myAllocateMemory();
+  myBuildMelFilterbank();
+
+#ifdef USE_BAKED_WEIGHTS
+  memcpy(myConv1_w,  myModel_conv1_w,  CONV1_WEIGHTS  * sizeof(float));
+  memcpy(myConv1_b,  myModel_conv1_b,  CONV1_FILTERS  * sizeof(float));
+  memcpy(myConv2_w,  myModel_conv2_w,  CONV2_WEIGHTS  * sizeof(float));
+  memcpy(myConv2_b,  myModel_conv2_b,  CONV2_FILTERS  * sizeof(float));
+  memcpy(myOutput_w, myModel_output_w, OUTPUT_WEIGHTS * sizeof(float));
+  memcpy(myOutput_b, myModel_output_b, NUM_CLASSES    * sizeof(float));
+  myWeightsTrained = true;
+  Serial.println("Baked-in weights loaded");
+#endif
+
+  if (myLoadWeights()) Serial.println("SD weights loaded");
+
+  myResetMenuState();
+  delay(1000);
+  Serial.println("Ready. Tap A0 to navigate, 3+ taps to select.");
+  myDrawMenu();
+}
+
+void loop() {
+  myHandleMenuNavigation();
+}
+
+// ██████████████████████████████████████████████████████████████████████████████
+// ██  PART 1: AUDIO COLLECTION                                                  ██
+// ██████████████████████████████████████████████████████████████████████████████
+//
+// TAP (1-2)      = record 1-second clip via recordWAV(), save as .wav
+// LONG (3+ taps) = exit to menu
+// Serial T       = record,  L = exit
+//
+// No spectrogram computation here — just record and save.
+
+void myActionCollect(int classIdx) {
+  if (!mySDavailable) {
+    u8g2.firstPage();
+    do { u8g2.drawStr(0, 15, "No SD card"); } while (u8g2.nextPage());
+    delay(2000); myResetMenuState(); return;
+  }
+
+  Serial.printf("\n>>> Collect: %s\n", myClassLabels[classIdx].c_str());
+  Serial.println("  TAP=record  LONG PRESS=exit  L=exit");
+  myResetTouchState();
+
+  String folderPath = "/audio/" + myClassLabels[classIdx];
+  if (!SD.exists("/audio"))   SD.mkdir("/audio");
+  if (!SD.exists(folderPath)) SD.mkdir(folderPath);
+
+  // Count existing clips
+  int clipCount = 0;
+  {
+    File root = SD.open(folderPath);
+    if (root) {
+      while (File f = root.openNextFile()) {
+        if (!f.isDirectory() && String(f.name()).endsWith(".wav")) clipCount++;
+        f.close();
+      }
+      root.close();
+    }
+  }
+
+  auto myShowIdle = [&]() {
+    u8g2.firstPage();
+    do {
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 10, myClassLabels[classIdx].c_str());
+      char buf[20]; snprintf(buf, sizeof(buf), "Clips: %d", clipCount);
+      u8g2.drawStr(0, 22, buf);
+      u8g2.drawStr(0, 34, "TAP to record");
+    } while (u8g2.nextPage());
+  };
+  myShowIdle();
+
+  bool shouldRecord = false;
+
+  while (true) {
+    if (Serial.available()) {
+      char c = Serial.read();
+      if      (c == 'l' || c == 'L') { myResetMenuState(); return; }
+      else if (c == 't' || c == 'T') shouldRecord = true;
+    }
+    int ta = myCheckTouchInput();
+    if      (ta == 2) { myResetMenuState(); return; }
+    else if (ta == 1) shouldRecord = true;
+
+    if (shouldRecord) {
+      shouldRecord = false;
+
+      // Countdown
+      u8g2.firstPage();
+      do {
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(0, 12, "GET READY...");
+        u8g2.drawStr(0, 26, "Recording in 1s");
+      } while (u8g2.nextPage());
+      delay(800);
+
+      // Recording banner — recordWAV() blocks for exactly CLIP_SECONDS
+      u8g2.firstPage();
+      do {
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(0, 15, "** RECORDING **");
+        u8g2.drawStr(0, 28, "1 second...");
+      } while (u8g2.nextPage());
+
+      String fileName = folderPath + "/clip_" + String(millis()) + ".wav";
+      if (mySaveClipToSD(fileName)) {
+        clipCount++;
+        Serial.printf("Saved: %s  (total: %d)\n", fileName.c_str(), clipCount);
+      } else {
+        Serial.println("ERROR: save failed");
+        u8g2.firstPage();
+        do { u8g2.drawStr(0, 15, "SAVE FAILED"); } while (u8g2.nextPage());
+        delay(1000);
+      }
+
+      myShowIdle();   // back to ready state immediately
+    }
+    delay(10);
+  }
+}
+
+// ██████████████████████████████████████████████████████████████████████████████
+// ██  PART 2: TRAINING                                                          ██
+// ██████████████████████████████████████████████████████████████████████████████
+//
+// Loads clips one at a time from SD (no pre-loading — PSRAM holds one
+// spectrogram at a time).  Each clip takes ~3-5 s to process (O(N^2) DFT).
+// Expected time: clips_per_class * NUM_CLASSES * TARGET_EPOCHS * ~4s
+// e.g. 10 clips x 3 classes x 20 epochs x 4s = ~40 minutes total.
+// Serial monitor prints batch loss/acc every 10 batches.
+// L or 3+ taps saves weights and exits at any time.
+
+void myActionTrain() {
+  if (!mySDavailable) {
+    u8g2.firstPage();
+    do { u8g2.drawStr(0, 15, "No SD card"); } while (u8g2.nextPage());
+    delay(2000); myResetMenuState(); return;
+  }
+
+  Serial.println("\n>>> Training  (L or 3+ taps = save & exit)");
+  myResetTouchState();
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 15, "TRAINING MODE");
+    u8g2.drawStr(0, 28, "Scanning SD...");
+  } while (u8g2.nextPage());
+
+  if (myLoadWeights()) Serial.println("Continuing from saved weights");
+  else                 Serial.println("Starting fresh (He-init)");
+
+  while (true) {
+    // ---- Scan SD — build FULL paths explicitly ----
+    // BUG FIX v6: f.path() returns only the bare filename on the Seeed SD
+    // library.  Build the full path as folderPath + "/" + f.name() instead.
+    myTrainingData.clear();
+    int classCounts[NUM_CLASSES] = {};
+
+    for (int i = 0; i < NUM_CLASSES; i++) {
+      String folderPath = "/audio/" + myClassLabels[i];
+      File root = SD.open(folderPath);
+      if (root) {
+        while (File f = root.openNextFile()) {
+          if (!f.isDirectory() && String(f.name()).endsWith(".wav")) {
+            String fullPath = folderPath + "/" + String(f.name());
+            myTrainingData.push_back({fullPath, i});
+            classCounts[i]++;
+          }
+          f.close();
+        }
+        root.close();
+      }
+    }
+
+    // Report scan results — if all zeros the folder names are wrong
+    Serial.println("--- Clip scan ---");
+    for (int i = 0; i < NUM_CLASSES; i++)
+      Serial.printf("  %s: %d clips\n", myClassLabels[i].c_str(), classCounts[i]);
+
+    u8g2.firstPage();
+    do {
+      u8g2.setFont(u8g2_font_5x7_tf);
+      u8g2.drawStr(0, 8, "Clips found:");
+      for (int i = 0; i < min(NUM_CLASSES, 3); i++) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), " %s:%d", myClassLabels[i].c_str(), classCounts[i]);
+        u8g2.drawStr(0, 18 + i * 9, buf);
+      }
+    } while (u8g2.nextPage());
+    delay(1500);
+
+    if (myTrainingData.empty()) {
+      u8g2.firstPage();
+      do { u8g2.drawStr(0, 20, "No clips found!"); } while (u8g2.nextPage());
+      delay(2000); myResetMenuState(); return;
+    }
+
+    // Sort for deterministic validation split
+    std::sort(myTrainingData.begin(), myTrainingData.end(),
+              [](const TrainingItem& a, const TrainingItem& b) { return a.path < b.path; });
+
+    // Validation split: hold out last VALIDATION_CLIPS per class
+    std::vector<TrainingItem> myValidationData;
+    if (VALIDATION_CLIPS > 0) {
+      int counts[NUM_CLASSES] = {};
+      for (auto& item : myTrainingData) counts[item.label]++;
+      int skip[NUM_CLASSES];
+      for (int c = 0; c < NUM_CLASSES; c++) skip[c] = min(VALIDATION_CLIPS, counts[c]);
+      std::vector<TrainingItem> trainOnly;
+      int seen[NUM_CLASSES] = {};
+      for (int i = (int)myTrainingData.size() - 1; i >= 0; i--) {
+        int c = myTrainingData[i].label;
+        if (seen[c] < skip[c]) { myValidationData.push_back(myTrainingData[i]); seen[c]++; }
+        else                    trainOnly.push_back(myTrainingData[i]);
+      }
+      myTrainingData = trainOnly;
+      Serial.printf("Train: %d  Val: %d\n",
+                    (int)myTrainingData.size(), (int)myValidationData.size());
+    }
+
+    int total           = myTrainingData.size();
+    int batchesPerEpoch = (total + BATCH_SIZE - 1) / BATCH_SIZE;
+    int totalBatches    = TARGET_EPOCHS * batchesPerEpoch;
+    Serial.printf("%d clips, %d epochs, %d batches total\n",
+                  total, TARGET_EPOCHS, totalBatches);
+    Serial.printf("Estimated time: ~%.0f minutes\n",
+                  (float)total * TARGET_EPOCHS * 4.0f / 60.0f);
+
+    std::vector<int> indices;
+    for (int i = 0; i < total; i++) indices.push_back(i);
+    float runningLoss = 0; int lossCount = 0;
+
+    for (int batch = 0; batch < totalBatches; batch++) {
+      // Exit check
+      if (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'l' || c == 'L' || c == 'x' || c == 'X') {
+          mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
+        }
+      }
+      myCheckTouchBackground();
+      if (myPeekTouchAction() == 2) {
+        myCheckTouchInput();
+        mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
+      }
+
+      // Shuffle at epoch start
+      if (batch % batchesPerEpoch == 0) {
+        int epoch = batch / batchesPerEpoch + 1;
+        Serial.printf("\n--- Epoch %d/%d ---\n", epoch, TARGET_EPOCHS);
+        for (int i = total - 1; i > 0; i--) {
+          int j = random(i + 1);
+          int tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
+        }
+      }
+
+      int batchStart = (batch % batchesPerEpoch) * BATCH_SIZE;
+      int batchEnd   = min(batchStart + BATCH_SIZE, total);
+      float batchLoss = 0; int correct = 0; int loadFails = 0;
+
+      memset(myConv1_w_grad,  0, CONV1_WEIGHTS  * sizeof(float));
+      memset(myConv1_b_grad,  0, CONV1_FILTERS  * sizeof(float));
+      memset(myConv2_w_grad,  0, CONV2_WEIGHTS  * sizeof(float));
+      memset(myConv2_b_grad,  0, CONV2_FILTERS  * sizeof(float));
+      memset(myOutput_w_grad, 0, OUTPUT_WEIGHTS * sizeof(float));
+      memset(myOutput_b_grad, 0, NUM_CLASSES    * sizeof(float));
+
+      for (int i = batchStart; i < batchEnd; i++) {
+        TrainingItem& clip = myTrainingData[indices[i]];
+        if (!myLoadClipAndComputeSpectrogram(clip.path.c_str())) {
+          loadFails++;
+          continue;
+        }
+
+        float logits[NUM_CLASSES];
+        myForwardPass(myInputBuffer, logits);
+        batchLoss += -logf(max(myDense_output[clip.label], 1e-7f));
+        int pred = 0;
+        for (int j = 1; j < NUM_CLASSES; j++)
+          if (myDense_output[j] > myDense_output[pred]) pred = j;
+        if (pred == clip.label) correct++;
+
+        myBackwardDense(clip.label);
+        myBackwardConv2();
+        myBackwardPool1();
+        myBackwardConv1();
+
+        // Periodic exit check inside batch
+        if (i % 3 == 0) {
+          myCheckTouchBackground();
+          if (myPeekTouchAction() == 2) {
+            myCheckTouchInput();
+            mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
+          }
+          if (Serial.available()) {
+            char c = Serial.read();
+            if (c == 'l' || c == 'L' || c == 'x' || c == 'X') {
+              mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
+            }
+          }
+        }
+      }
+
+      myUpdateWeights(batch + 1);
+
+      int processed = (batchEnd - batchStart) - loadFails;
+      float avgLoss  = processed > 0 ? batchLoss / processed : 0;
+      float batchAcc = processed > 0 ? (float)correct / processed : 0;
+      runningLoss += avgLoss; lossCount++;
+
+      // OLED update every 5 batches
+      if ((batch + 1) % 5 == 0) {
+        float dLoss = runningLoss / lossCount;
+        u8g2.firstPage();
+        do {
+          u8g2.setFont(u8g2_font_5x7_tf);
+          u8g2.setCursor(0, 10); u8g2.print("Training...");
+          u8g2.setCursor(0, 20); u8g2.print("B:"); u8g2.print(batch + 1);
+            u8g2.print("/"); u8g2.print(totalBatches);
+          u8g2.setCursor(0, 30); u8g2.print("L:"); u8g2.print(dLoss, 3);
+          u8g2.setCursor(0, 40); u8g2.print("A:"); u8g2.print((int)(batchAcc * 100)); u8g2.print("%");
+        } while (u8g2.nextPage());
+        runningLoss = 0; lossCount = 0;
+      }
+
+      // Serial update every 10 batches
+      if ((batch + 1) % 10 == 0)
+        Serial.printf("Batch %d/%d  Loss:%.4f  Acc:%.1f%%%s\n",
+                      batch + 1, totalBatches, avgLoss, batchAcc * 100,
+                      loadFails > 0 ? "  *** LOAD FAILS ***" : "");
+    }
+
+    Serial.println("\n--- Training complete ---");
+
+    // Validation pass
+    if (!myValidationData.empty()) {
+      int valCorrect = 0, valCount = 0;
+      for (auto& vitem : myValidationData) {
+        if (!myLoadClipAndComputeSpectrogram(vitem.path.c_str())) continue;
+        float logits[NUM_CLASSES];
+        myForwardPass(myInputBuffer, logits);
+        int pred = 0;
+        for (int j = 1; j < NUM_CLASSES; j++)
+          if (myDense_output[j] > myDense_output[pred]) pred = j;
+        if (pred == vitem.label) valCorrect++;
+        valCount++;
+      }
+      if (valCount > 0)
+        Serial.printf("Val: %.1f%%  (%d/%d)\n",
+                      100.0f * valCorrect / valCount, valCorrect, valCount);
+    }
+
+    mySaveWeights(); myWeightsTrained = true;
+
+    u8g2.firstPage();
+    do {
+      u8g2.drawStr(0, 12, "DONE!");
+      u8g2.drawStr(0, 24, "Tap: train again");
+      u8g2.drawStr(0, 36, "3+:  exit");
+    } while (u8g2.nextPage());
+
+    myResetTouchState();
+    Serial.println("T=train again  L=exit");
+    while (true) {
+      if (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'l' || c == 'L' || c == 'x' || c == 'X') { myResetMenuState(); return; }
+        else if (c == 't' || c == 'T') break;
+      }
+      int ta = myCheckTouchInput();
+      if      (ta == 2) { myResetMenuState(); return; }
+      else if (ta == 1) break;
+      delay(10);
+    }
+  }
+}
+
+// ██████████████████████████████████████████████████████████████████████████████
+// ██  PART 3: INFERENCE (VAD-triggered)                                         ██
+// ██████████████████████████████████████████████████████████████████████████████
+//
+// Short readBytes() calls probe mic energy (100 ms windows — fast enough).
+// When RMS exceeds threshold, recordWAV() captures a full 1-second clip,
+// PCM is copied to myAudioBuffer, spectrogram computed, then classified.
+
+#define myVadWindowMs  100
+#define myVadThreshold 500
+#define myVadHoldMs    150
+
+void myActionInfer() {
+  if (!myWeightsTrained) {
+    u8g2.firstPage();
+    do {
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 12, "No weights!");
+      u8g2.drawStr(0, 24, "Train first");
+    } while (u8g2.nextPage());
+    delay(3000); myResetMenuState(); return;
+  }
+
+  Serial.println("\n>>> Inference (VAD)  T or L to exit");
+  myResetTouchState();
+
+  int   lastPred  = 0;
+  float lastConf  = 0;
+  bool  vadActive = false;
+  unsigned long vadRiseTime = 0;
+
+  // Stack buffer for VAD probe (100 ms = 1600 samples = 3200 bytes)
+  const int VAD_SAMPLES = (SAMPLE_RATE * myVadWindowMs) / 1000;
+  int16_t vadBuf[VAD_SAMPLES];
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 12, "LISTENING...");
+    u8g2.drawStr(0, 26, "Waiting 4 sound");
+  } while (u8g2.nextPage());
+
+  while (true) {
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c == 't' || c == 'T' || c == 'l' || c == 'L') { myResetMenuState(); return; }
+    }
+    if (myCheckTouchInput() != 0) { myResetMenuState(); return; }
+
+    // VAD energy probe — short readBytes() completes in ~100 ms
+    size_t got        = myI2S.readBytes((char*)vadBuf, VAD_SAMPLES * sizeof(int16_t));
+    int    samplesGot = (int)(got / sizeof(int16_t));
+    int64_t sumSq = 0;
+    for (int i = 0; i < samplesGot; i++) sumSq += (int64_t)vadBuf[i] * vadBuf[i];
+    float rms = samplesGot > 0 ? sqrtf((float)(sumSq / samplesGot)) : 0;
+
+    if (rms > myVadThreshold) {
+      if (!vadActive) { vadActive = true; vadRiseTime = millis(); }
+      else if (millis() - vadRiseTime >= myVadHoldMs) {
+        vadActive = false;
+        Serial.printf("VAD triggered (RMS=%.0f)\n", rms);
+
+        u8g2.firstPage();
+        do {
+          u8g2.setFont(u8g2_font_6x10_tf);
+          u8g2.drawStr(0, 15, "RECORDING...");
+        } while (u8g2.nextPage());
+
+        // recordWAV() for clean 1-second capture
+        size_t   wav_size   = 0;
+        uint8_t* wav_buffer = myI2S.recordWAV(CLIP_SECONDS, &wav_size);
+        bool classified = false;
+
+        if (wav_buffer && wav_size > 44) {
+          // Copy PCM (skip 44-byte WAV header) into myAudioBuffer
+          size_t pcmBytes = min(wav_size - 44,
+                                (size_t)(CLIP_SAMPLES * sizeof(int16_t)));
+          memcpy(myAudioBuffer, wav_buffer + 44, pcmBytes);
+          if (pcmBytes < CLIP_SAMPLES * sizeof(int16_t))
+            memset((uint8_t*)myAudioBuffer + pcmBytes, 0,
+                   CLIP_SAMPLES * sizeof(int16_t) - pcmBytes);
+          free(wav_buffer);
+
+          if (myComputeSpectrogram()) {
+            float logits[NUM_CLASSES];
+            myForwardPass(myInputBuffer, logits);
+            lastPred = 0;
+            for (int i = 1; i < NUM_CLASSES; i++)
+              if (myDense_output[i] > myDense_output[lastPred]) lastPred = i;
+            lastConf    = myDense_output[lastPred];
+            classified  = true;
+
+            Serial.printf("=> %s (%.1f%%)", myClassLabels[lastPred].c_str(), lastConf * 100);
+            for (int i = 0; i < NUM_CLASSES; i++)
+              Serial.printf("  %s:%.0f%%", myClassLabels[i].c_str(), myDense_output[i] * 100);
+            Serial.println();
+
+            // OLED: spectrogram + label bar
+            int oW = u8g2.getDisplayWidth();
+            int oH = u8g2.getDisplayHeight();
+            u8g2.firstPage();
+            do {
+              for (int px = 0; px < oW; px++) {
+                int frIdx = (int)(px * (float)MEL_FRAMES / oW);
+                for (int py = 0; py < oH - 12; py++) {
+                  int binIdx = MEL_BINS - 1 - (int)(py * (float)MEL_BINS / (oH - 12));
+                  if (myInputBuffer[frIdx * MEL_BINS + binIdx] > 0.35f)
+                    u8g2.drawPixel(px, py);
+                }
+              }
+              u8g2.setFont(u8g2_font_5x7_tf);
+              u8g2.setColorIndex(0);
+              u8g2.drawBox(0, oH - 11, oW, 11);
+              u8g2.setColorIndex(1);
+              char buf[24];
+              snprintf(buf, sizeof(buf), "%s %d%%",
+                       myClassLabels[lastPred].c_str(), (int)(lastConf * 100));
+              u8g2.drawStr(1, oH - 2, buf);
+            } while (u8g2.nextPage());
+            delay(1000);
+          }
+        } else {
+          if (wav_buffer) free(wav_buffer);
+          Serial.println("recordWAV() failed in inference");
+        }
+
+        // Back to listening screen
+        u8g2.firstPage();
+        do {
+          u8g2.setFont(u8g2_font_5x7_tf);
+          u8g2.drawStr(0, 10, "LISTENING...");
+          if (classified) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "Last:%s %d%%",
+                     myClassLabels[lastPred].c_str(), (int)(lastConf * 100));
+            u8g2.drawStr(0, 22, buf);
+          }
+        } while (u8g2.nextPage());
+      }
+    } else {
+      vadActive = false;
+    }
+
+    delay(5);
+  }
+}
