@@ -52,7 +52,7 @@ const int myTotalItems = NUM_CLASSES + 2;   // classes + Train + Infer
 float LEARNING_RATE    = 0.0003f;
 int   BATCH_SIZE       = 6;
 int   TARGET_EPOCHS    = 20;
-int   VALIDATION_CLIPS = 2;   // clips per class held out for validation
+int   VALIDATION_CLIPS = 4;   // clips per class held out for validation
                                // (reduced from 3 — safer for small datasets)
 
 // ======================================================
