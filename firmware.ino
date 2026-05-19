@@ -1,6 +1,6 @@
 // ======================================================
 // XIAO ESP32-S3 SENSE
-// FULL AUDIO ML — WAKE WORD CLASSIFICATION v12
+// FULL AUDIO ML — WAKE WORD CLASSIFICATION v13
 //
 //
 //
@@ -52,10 +52,9 @@ const int myTotalItems = NUM_CLASSES + 2;   // classes + Train + Infer
 float LEARNING_RATE    = 0.003f;   //= 0.0003f;
 int   BATCH_SIZE       = 12;          // 6;
 int   TARGET_EPOCHS    = 20;         //  20;
-int   VALIDATION_CLIPS = 4l
-;   // clips per class held out for validation
-                               // (reduced from 3 — safer for small datasets)
-
+int   VALIDATION_CLIPS = 4l;      // Note this is 4 and "l" for long data type (a 64-bit integer) 
+                                  // instead of a standard int (a 32-bit integer).
+                                  // clips per class held out for validation
 // ======================================================
 // AUDIO / SPECTROGRAM CONSTANTS
 // ======================================================
@@ -1463,12 +1462,6 @@ void myActionInfer() {
         vadActive = false;
         //Serial.printf("VAD triggered (RMS=%.0f)\n", rms);  // I don't need this
 
-        u8g2.firstPage();
-        do {
-          u8g2.setFont(u8g2_font_6x10_tf);
-          u8g2.drawStr(0, 15, "RECORDING...");
-        } while (u8g2.nextPage());
-
         size_t   wav_size   = 0;
         uint8_t* wav_buffer = myI2S.recordWAV(CLIP_SECONDS, &wav_size);
         bool classified = false;
@@ -1496,64 +1489,63 @@ void myActionInfer() {
               Serial.printf("  %s:%.0f%%", myClassLabels[i].c_str(), myDense_output[i] * 100);
             Serial.println();
 
-            // ---- OLED: confidence bar chart ----
-            // Top half: spectrogram thumbnail
-            // Bottom: class bars
-            int oW = u8g2.getDisplayWidth();   // 72
-            int oH = u8g2.getDisplayHeight();  // 40
-            int barAreaTop = oH / 2;           // 20
-            int barH = (oH - barAreaTop) / NUM_CLASSES;  // pixels per class bar
+            // ---- OLED: class name + percent (top), bar chart (bottom) ----
+            {
+              const char* lbl = myClassLabels[lastPred].c_str();
+              if (lbl[0] >= '0' && lbl[0] <= '9') lbl++;   // skip numeric prefix
 
-            u8g2.firstPage();
-            do {
-              u8g2.setFont(u8g2_font_4x6_tf);
+              int oW  = u8g2.getDisplayWidth();    // 72
+              int oH  = u8g2.getDisplayHeight();   // 40
+              int pct = (int)(lastConf * 100);
 
-              // Spectrogram thumbnail (top half)
-              for (int px = 0; px < oW; px++) {
-                int frIdx = (int)(px * (float)MEL_FRAMES / oW);
-                for (int py = 0; py < barAreaTop - 2; py++) {
-                  int binIdx = MEL_BINS - 1 - (int)(py * (float)MEL_BINS / (barAreaTop - 2));
-                  if (myInputBuffer[frIdx * MEL_BINS + binIdx] > 0.35f)
-                    u8g2.drawPixel(px, py);
+              u8g2.firstPage();
+              do {
+                // --- Top: class name + confidence percent ---
+                u8g2.setFont(u8g2_font_6x10_tf);
+                u8g2.drawStr(0, 10, lbl);
+
+                char pctBuf[8];
+                snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
+                u8g2.drawStr(0, 22, pctBuf);
+
+                // --- Separator ---
+                u8g2.drawHLine(0, 24, oW);
+
+                // --- Bottom: mini bar per class ---
+                u8g2.setFont(u8g2_font_4x6_tf);
+                int barAreaTop = 26;
+                int barH = (oH - barAreaTop) / NUM_CLASSES;
+                if (barH < 4) barH = 4;
+
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                  int y    = barAreaTop + c * barH;
+                  int barW = (int)(myDense_output[c] * (oW - 1));
+                  if (barW < 1) barW = 1;
+                  if (c == lastPred) u8g2.drawBox(0, y, barW, barH - 1);
+                  else               u8g2.drawFrame(0, y, barW, barH - 1);
                 }
-              }
-
-              // Separator line
-              u8g2.drawHLine(0, barAreaTop - 1, oW);
-
-              // Bar chart: one bar per class
-              for (int c = 0; c < NUM_CLASSES; c++) {
-                int y     = barAreaTop + c * barH;
-                int barW  = (int)(myDense_output[c] * (oW - 1));
-                // Filled bar for predicted class, outline for others
-                if (c == lastPred) u8g2.drawBox(0, y, barW, barH - 1);
-                else               u8g2.drawFrame(0, y, max(1, barW), barH - 1);
-                // Label (first 5 chars, skip numeric prefix)
-                const char* lbl = myClassLabels[c].c_str();
-                if (lbl[0] >= '0' && lbl[0] <= '9') lbl++;   // skip "0", "1", "2" prefix
-                u8g2.drawStr(1, y + barH - 2, lbl);
-              }
-
-            } while (u8g2.nextPage());
-            delay(1500);
+              } while (u8g2.nextPage());
+              // No delay — return to listening loop immediately
+            }
           }
         } else {
           if (wav_buffer) free(wav_buffer);
           Serial.println("recordWAV() failed in inference");
         }
 
-        // Back to listening screen
+        // Back to listening — show last result continuously
         u8g2.firstPage();
         do {
-          u8g2.setFont(u8g2_font_5x7_tf);
-          u8g2.drawStr(0, 10, "LISTENING...");
+          u8g2.setFont(u8g2_font_6x10_tf);
           if (classified) {
             const char* lbl = myClassLabels[lastPred].c_str();
             if (lbl[0] >= '0' && lbl[0] <= '9') lbl++;
-            char buf[24];
-            snprintf(buf, sizeof(buf), "Last:%s %d%%",
-                     lbl, (int)(lastConf * 100));
-            u8g2.drawStr(0, 22, buf);
+            u8g2.drawStr(0, 12, lbl);
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d%%", (int)(lastConf * 100));
+            u8g2.drawStr(0, 26, buf);
+          } else {
+            u8g2.drawStr(0, 12, "Listening...");
           }
         } while (u8g2.nextPage());
       }
