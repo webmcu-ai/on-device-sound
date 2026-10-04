@@ -1,6 +1,8 @@
 # on-device-sound
 On device sound machine learning model recording training and inference
 
+Live Demo https://webmcu-ai.github.io/on-device-sound/index.html
+
 
 
 ## CHANGELOG
